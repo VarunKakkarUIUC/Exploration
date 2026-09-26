@@ -294,6 +294,19 @@ filtered_df["Upside Score"] = (
     * (1 + 0.15 * filtered_df["Analyst Upside (%)"].fillna(0).clip(-100, 100) / 100)
 ).round(1)
 filtered_df = filtered_df.sort_values("Upside Score", ascending=False)
+filtered_df = filtered_df.reset_index(drop=True)
+
+page_sizes = [10, 20, 50]
+if "results_page_size" not in st.session_state:
+    st.session_state["results_page_size"] = 10
+filter_signature = (
+    tuple(filtered_df["Symbol"].tolist()),
+    st.session_state["results_page_size"],
+)
+if st.session_state.get("results_filter_signature") != filter_signature:
+    st.session_state["results_page"] = 0
+    st.session_state["selected_stock_rows"] = []
+    st.session_state["results_filter_signature"] = filter_signature
 
 # 5. UI Layout Display
 col1, col2 = st.columns([1, 3])
@@ -305,15 +318,23 @@ with col2:
 
 st.subheader("🔍 Filtered Candidates Matrix")
 if not filtered_df.empty:
-    # Render the data table cleanly with numerical formatting hooks
+    total_results = len(filtered_df)
+    page_size = st.session_state["results_page_size"]
+    page_count = (total_results + page_size - 1) // page_size
+    current_page = min(st.session_state.get("results_page", 0), page_count - 1)
+    start = current_page * page_size
+    end = min(start + page_size, total_results)
+
     selected_rows = st.session_state.get("selected_stock_rows", [])
+    page_df = filtered_df.iloc[start:end]
+    page_selected_rows = [row for row in selected_rows if start <= row < end]
 
     def highlight_selected_rows(row):
-        if row.name in selected_rows:
+        if row.name in page_selected_rows:
             return ["background-color: #fff3b0; color: #111827"] * len(row)
         return [""] * len(row)
 
-    styled_results = filtered_df.style.apply(highlight_selected_rows, axis=1).format({
+    styled_results = page_df.style.apply(highlight_selected_rows, axis=1).format({
             "Current Price ($)": "${:,.2f}",
             "50-Day MA ($)": "${:,.2f}",
             "200-Day MA ($)": "${:,.2f}",
@@ -328,20 +349,45 @@ if not filtered_df.empty:
         }, na_rep="Unavailable")
     selection = st.dataframe(
         styled_results,
-        key="stock_results",
+        key=f"stock_results_page_{current_page}_{page_size}",
         on_select="rerun",
         selection_mode="multi-row",
-        use_container_width=True
+        width="stretch",
+        height=min(640, 46 + page_size * 35),
     )
-    current_selected_rows = list(selection.selection.rows)
-    if current_selected_rows != selected_rows:
-        st.session_state["selected_stock_rows"] = current_selected_rows
+    current_page_selection = {
+        start + row for row in selection.selection.rows
+    }
+    next_selected_rows = sorted(
+        (set(selected_rows) - set(range(start, end))) | current_page_selection
+    )
+    if next_selected_rows != selected_rows:
+        st.session_state["selected_stock_rows"] = next_selected_rows
         st.rerun()
-    
-    # Optional Visual Layout: Render a quick chart mapping matching companies by scale
-    st.subheader("📈 Market Capitalization Overview")
-    st.bar_chart(filtered_df.set_index("Symbol")["Market Cap ($B)"])
 
+    previous_col, range_col, size_col, next_col = st.columns([1, 2, 1, 1])
+    with previous_col:
+        if st.button("← Previous", disabled=current_page == 0, use_container_width=True):
+            st.session_state["results_page"] = current_page - 1
+            st.rerun()
+    with range_col:
+        st.markdown(
+            f"<div style='text-align:center;padding:.45rem 0'>{start + 1}–{end} of {total_results} · Page {current_page + 1} of {page_count}</div>",
+            unsafe_allow_html=True,
+        )
+    with size_col:
+        st.selectbox(
+            "Rows per page",
+            page_sizes,
+            key="results_page_size",
+            format_func=lambda size: f"{size} per page",
+            label_visibility="collapsed",
+        )
+    with next_col:
+        if st.button("Next →", disabled=current_page >= page_count - 1, use_container_width=True):
+            st.session_state["results_page"] = current_page + 1
+            st.rerun()
+    
     if selected_rows:
         selected_stocks = filtered_df.iloc[[row for row in selected_rows if row < len(filtered_df)]]
         price_history = pd.concat(
