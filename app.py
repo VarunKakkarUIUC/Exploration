@@ -64,9 +64,9 @@ stock_universe = st.sidebar.selectbox(
     on_change=reset_filters_for_universe_change,
 )
 selected_symbols = st.sidebar.text_input(
-    "Select Stocks (optional)",
-    placeholder="e.g. NVDA, MSFT, AAPL",
-    help="For Custom tickers, enter symbols separated by commas. For index universes, use this to narrow the results.",
+    "Search stocks (optional)",
+    placeholder="e.g. AAPL, Apple, MSFT",
+    help="In Custom tickers, enter ticker symbols or company names separated by commas. In index universes, use this to narrow the results.",
 )
 analyst_rating_options = [
     "All ratings", "Strong Buy", "Buy", "Hold", "Underperform", "Sell", "Unavailable"
@@ -88,6 +88,38 @@ sectors_list = ["All", "Semiconductors and Semiconductor Equipment", "Software",
 selected_sector = st.sidebar.selectbox("Filter by Industry Sector", sectors_list, key="selected_sector")
 
 # 3. S&P 500 Market Fetcher Engine
+@st.cache_data(ttl=86400, show_spinner=False)
+def resolve_custom_stock(search_term):
+    search_term = search_term.strip()
+    normalized_symbol = search_term.upper().replace(".", "-")
+    try:
+        quotes = yf.Search(search_term, max_results=10).quotes
+    except Exception:
+        quotes = []
+
+    exact_match = next(
+        (
+            quote for quote in quotes
+            if quote.get("symbol", "").upper().replace(".", "-") == normalized_symbol
+        ),
+        None,
+    )
+    if exact_match:
+        return exact_match["symbol"], exact_match.get("shortname") or exact_match.get("longname") or search_term
+
+    looks_like_symbol = len(search_term) <= 6 and (
+        search_term.isupper() or "." in search_term or "-" in search_term
+    )
+    if looks_like_symbol or not quotes:
+        return search_term.upper(), search_term
+
+    best_match = quotes[0]
+    return (
+        best_match.get("symbol", search_term.upper()),
+        best_match.get("shortname") or best_match.get("longname") or search_term,
+    )
+
+
 @st.cache_data(ttl=3600, show_spinner="Loading S&P 500 fundamentals...")
 def load_market_universe(stock_universe, custom_symbols):
     if stock_universe == "S&P 500":
@@ -101,10 +133,14 @@ def load_market_universe(stock_universe, custom_symbols):
         security_column = "Company"
         sector_column = "ICB Industry[1]"
     else:
-        symbols = [symbol.strip().upper() for symbol in custom_symbols.split(",") if symbol.strip()]
+        custom_stocks = [
+            resolve_custom_stock(search_term)
+            for search_term in custom_symbols.split(",")
+            if search_term.strip()
+        ]
         constituents = pd.DataFrame([
-            {"Symbol": symbol, "Security": symbol, "GICS Sector": "Custom"}
-            for symbol in dict.fromkeys(symbols)
+            {"Symbol": symbol, "Security": name, "GICS Sector": "Custom"}
+            for symbol, name in dict(custom_stocks).items()
         ], columns=["Symbol", "Security", "GICS Sector"])
         ticker_column = "Symbol"
         security_column = "Security"
@@ -225,6 +261,21 @@ def load_market_universe(stock_universe, custom_symbols):
     return pd.DataFrame(records, columns=MARKET_DATA_COLUMNS), price_histories
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def load_intraday_price_history(symbol, period, interval):
+    try:
+        history = yf.Ticker(symbol.replace(".", "-")).history(
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+        )
+        if history.empty or "Close" not in history:
+            return pd.DataFrame()
+        return history[["Close"]].rename(columns={"Close": symbol})
+    except Exception:
+        return pd.DataFrame()
+
+
 df, price_histories = load_market_universe(stock_universe, selected_symbols)
 
 if df.empty:
@@ -247,9 +298,10 @@ symbols = {
     if symbol.strip()
 }
 if symbols:
-    filtered_df = filtered_df[
-        filtered_df["Symbol"].str.upper().str.replace(".", "-", regex=False).isin(symbols)
-    ]
+    if stock_universe != "Custom tickers":
+        filtered_df = filtered_df[
+            filtered_df["Symbol"].str.upper().str.replace(".", "-", regex=False).isin(symbols)
+        ]
 
 if selected_analyst_rating != "All ratings":
     filtered_df = filtered_df[filtered_df["Analyst Rating"] == selected_analyst_rating]
@@ -257,7 +309,7 @@ if selected_analyst_rating != "All ratings":
 if selected_sector != "All":
     filtered_df = filtered_df[filtered_df["Sector"] == selected_sector]
 
-if symbols:
+if symbols and stock_universe != "Custom tickers":
     visible_symbols = set(filtered_df["Symbol"].str.upper().str.replace(".", "-", regex=False))
     explanations = []
     for symbol in sorted(symbols - visible_symbols):
@@ -344,6 +396,10 @@ if not filtered_df.empty:
     if selected_rows != st.session_state.get("selected_stock_rows", []):
         st.session_state["selected_stock_rows"] = selected_rows
     selected_stock_index = selected_rows[0] if selected_rows else None
+    visible_columns = list(
+        filtered_df.columns[:filtered_df.columns.get_loc("Current Price ($)") + 1]
+    )
+    detail_columns = [column for column in filtered_df.columns if column not in visible_columns]
 
     def format_results(dataframe):
         return dataframe.style.format({
@@ -363,11 +419,35 @@ if not filtered_df.empty:
     if selected_stock_index is not None:
         selected_stock = filtered_df.iloc[[selected_stock_index]]
         st.dataframe(
-            format_results(selected_stock),
+            format_results(selected_stock[visible_columns]),
             key=f"selected_stock_{selected_stock.iloc[0]['Symbol']}",
             width="stretch",
             height=120,
         )
+        st.markdown("**Selected Stock Details**")
+        detail_rows = []
+        for column in detail_columns:
+            value = selected_stock.iloc[0][column]
+            if pd.isna(value):
+                value = "Unavailable"
+            elif column == "Average Analyst Target ($)":
+                value = f"${value:,.2f}"
+            elif column == "Market Cap ($B)":
+                value = f"${value:,.1f}B"
+            elif column == "Analyst Upside (%)":
+                value = f"{value:+.1f}%"
+            elif column in {"50-Day MA ($)", "200-Day MA ($)"}:
+                value = f"${value:,.2f}"
+            elif column == "News Sentiment":
+                value = f"{value:+.2f}"
+            elif column == "Analyst Score":
+                value = f"{value:+.2f}"
+            elif column == "P/E Ratio":
+                value = f"{value:.1f}x"
+            elif column == "Net Margin (%)":
+                value = f"{value:.1f}%"
+            detail_rows.append({"Detail": column, "Value": value})
+        st.dataframe(pd.DataFrame(detail_rows), hide_index=True, width="stretch")
         if st.button("Show all stocks", use_container_width=True):
             st.session_state["selected_stock_rows"] = []
             st.session_state["stock_table_revision"] = st.session_state.get("stock_table_revision", 0) + 1
@@ -376,7 +456,7 @@ if not filtered_df.empty:
         page_df = filtered_df.iloc[start:end]
         revision = st.session_state.get("stock_table_revision", 0)
         selection = st.dataframe(
-            format_results(page_df),
+            format_results(page_df[visible_columns]),
             key=f"stock_results_{current_page}_{page_size}_{revision}",
             on_select="rerun",
             selection_mode="single-row",
@@ -415,11 +495,42 @@ if not filtered_df.empty:
     
     if selected_rows:
         selected_stocks = filtered_df.iloc[[row for row in selected_rows if row < len(filtered_df)]]
+        chart_range = st.selectbox(
+            "Price chart range",
+            ["1 day", "1 week", "1 month", "3 months", "6 months", "1 year"],
+            index=5,
+            key="price_chart_range",
+        )
+        intraday_ranges = {
+            "1 day": ("1d", "5m"),
+            "1 week": ("5d", "30m"),
+        }
+        daily_range_days = {
+            "1 month": 30,
+            "3 months": 90,
+            "6 months": 180,
+            "1 year": 365,
+        }
+        if chart_range in intraday_ranges:
+            period, interval = intraday_ranges[chart_range]
+            histories = [
+                load_intraday_price_history(stock["Symbol"], period, interval)
+                for _, stock in selected_stocks.iterrows()
+            ]
+        else:
+            days = daily_range_days[chart_range]
+            histories = []
+            for _, stock in selected_stocks.iterrows():
+                history = price_histories.get(stock["Symbol"], pd.DataFrame())
+                if not history.empty:
+                    cutoff = history.index.max() - pd.Timedelta(days=days)
+                    history = history.loc[history.index >= cutoff]
+                histories.append(history)
         price_history = pd.concat(
-            [price_histories.get(stock["Symbol"], pd.DataFrame()) for _, stock in selected_stocks.iterrows()],
+            histories,
             axis=1,
         ).dropna(how="all")
-        st.subheader("📉 One-Year Price History")
+        st.subheader(f"📉 {chart_range.title()} Price History")
         if price_history.empty:
             st.warning("Price history is unavailable for the selected ticker(s).")
         else:
