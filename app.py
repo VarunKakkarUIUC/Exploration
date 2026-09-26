@@ -293,6 +293,18 @@ filtered_df["Upside Score"] = (
     * (1 + 0.15 * filtered_df["Analyst Score"])
     * (1 + 0.15 * filtered_df["Analyst Upside (%)"].fillna(0).clip(-100, 100) / 100)
 ).round(1)
+priority_columns = [
+    "Upside Score",
+    "Symbol",
+    "Name",
+    "Analyst Rating",
+    "Average Analyst Target ($)",
+]
+remaining_columns = [
+    column for column in filtered_df.columns
+    if column not in priority_columns and column != "Sector"
+]
+filtered_df = filtered_df[priority_columns + remaining_columns + ["Sector"]]
 filtered_df = filtered_df.sort_values("Upside Score", ascending=False)
 filtered_df = filtered_df.reset_index(drop=True)
 
@@ -325,16 +337,16 @@ if not filtered_df.empty:
     start = current_page * page_size
     end = min(start + page_size, total_results)
 
-    selected_rows = st.session_state.get("selected_stock_rows", [])
-    page_df = filtered_df.iloc[start:end]
-    page_selected_rows = [row for row in selected_rows if start <= row < end]
+    selected_rows = [
+        row for row in st.session_state.get("selected_stock_rows", [])
+        if 0 <= row < total_results
+    ]
+    if selected_rows != st.session_state.get("selected_stock_rows", []):
+        st.session_state["selected_stock_rows"] = selected_rows
+    selected_stock_index = selected_rows[0] if selected_rows else None
 
-    def highlight_selected_rows(row):
-        if row.name in page_selected_rows:
-            return ["background-color: #fff3b0; color: #111827"] * len(row)
-        return [""] * len(row)
-
-    styled_results = page_df.style.apply(highlight_selected_rows, axis=1).format({
+    def format_results(dataframe):
+        return dataframe.style.format({
             "Current Price ($)": "${:,.2f}",
             "50-Day MA ($)": "${:,.2f}",
             "200-Day MA ($)": "${:,.2f}",
@@ -347,46 +359,59 @@ if not filtered_df.empty:
             "Net Margin (%)": "{:.1f}%",
             "Upside Score": "{:.1f}"
         }, na_rep="Unavailable")
-    selection = st.dataframe(
-        styled_results,
-        key=f"stock_results_page_{current_page}_{page_size}",
-        on_select="rerun",
-        selection_mode="multi-row",
-        width="stretch",
-        height=min(640, 46 + page_size * 35),
-    )
-    current_page_selection = {
-        start + row for row in selection.selection.rows
-    }
-    next_selected_rows = sorted(
-        (set(selected_rows) - set(range(start, end))) | current_page_selection
-    )
-    if next_selected_rows != selected_rows:
-        st.session_state["selected_stock_rows"] = next_selected_rows
-        st.rerun()
 
-    previous_col, range_col, size_col, next_col = st.columns([1, 2, 1, 1])
-    with previous_col:
-        if st.button("← Previous", disabled=current_page == 0, use_container_width=True):
-            st.session_state["results_page"] = current_page - 1
-            st.rerun()
-    with range_col:
-        st.markdown(
-            f"<div style='text-align:center;padding:.45rem 0'>{start + 1}–{end} of {total_results} · Page {current_page + 1} of {page_count}</div>",
-            unsafe_allow_html=True,
+    if selected_stock_index is not None:
+        selected_stock = filtered_df.iloc[[selected_stock_index]]
+        st.dataframe(
+            format_results(selected_stock),
+            key=f"selected_stock_{selected_stock.iloc[0]['Symbol']}",
+            width="stretch",
+            height=120,
         )
-    with size_col:
-        st.selectbox(
-            "Rows per page",
-            page_sizes,
-            key="results_page_size",
-            format_func=lambda size: f"{size} per page",
-            label_visibility="collapsed",
-        )
-    with next_col:
-        if st.button("Next →", disabled=current_page >= page_count - 1, use_container_width=True):
-            st.session_state["results_page"] = current_page + 1
+        if st.button("Show all stocks", use_container_width=True):
+            st.session_state["selected_stock_rows"] = []
+            st.session_state["stock_table_revision"] = st.session_state.get("stock_table_revision", 0) + 1
             st.rerun()
+    else:
+        page_df = filtered_df.iloc[start:end]
+        revision = st.session_state.get("stock_table_revision", 0)
+        selection = st.dataframe(
+            format_results(page_df),
+            key=f"stock_results_{current_page}_{page_size}_{revision}",
+            on_select="rerun",
+            selection_mode="single-row",
+            width="stretch",
+            height=min(640, 46 + page_size * 35),
+        )
+        current_page_selection = list(selection.selection.rows)
+        next_selected_rows = [start + current_page_selection[0]] if current_page_selection else []
+        if next_selected_rows != selected_rows:
+            st.session_state["selected_stock_rows"] = next_selected_rows
+            st.session_state["stock_table_revision"] = revision + 1
+            st.rerun()
+
+        previous_col, range_col, size_col, next_col = st.columns([1, 2, 1, 1])
+        with previous_col:
+            if st.button("← Previous", disabled=current_page == 0, use_container_width=True):
+                st.session_state["results_page"] = current_page - 1
+                st.rerun()
+        with range_col:
+            st.markdown(
+                f"<div style='text-align:center;padding:.45rem 0'>{start + 1}–{end} of {total_results} · Page {current_page + 1} of {page_count}</div>",
+                unsafe_allow_html=True,
+            )
+        with size_col:
+            st.selectbox(
+                "Rows per page",
+                page_sizes,
+                key="results_page_size",
+                format_func=lambda size: f"{size} per page",
+                label_visibility="collapsed",
+            )
+        with next_col:
+            if st.button("Next →", disabled=current_page >= page_count - 1, use_container_width=True):
+                st.session_state["results_page"] = current_page + 1
+                st.rerun()
     
     if selected_rows:
         selected_stocks = filtered_df.iloc[[row for row in selected_rows if row < len(filtered_df)]]
